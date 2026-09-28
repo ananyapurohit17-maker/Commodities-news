@@ -18,6 +18,7 @@ import html
 import os
 import re
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 # ---------------------------------------------------------------------
 # 1. FEEDS — add/remove freely.
@@ -26,7 +27,14 @@ from datetime import datetime, timezone
 #    - TradingView has no public RSS feed — not pullable this way.
 #    - Moneycontrol: check moneycontrol.com/rss for their current list.
 # ---------------------------------------------------------------------
+def gnews(query):
+    """Google News RSS for a search query (India edition). Lets us pull
+    headlines from sites that don't publish a usable RSS feed."""
+    return ("https://news.google.com/rss/search?q=" + quote_plus(query)
+            + "&hl=en-IN&gl=IN&ceid=IN:en")
+
 FEEDS = {
+    # --- Direct RSS feeds (these include short summaries) ---
     "Barchart - Metals":           "https://www.barchart.com/news/rss/commodities/metals",
     "Barchart - Energies":         "https://www.barchart.com/news/rss/commodities/energies",
     "Barchart - Grains":           "https://www.barchart.com/news/rss/commodities/grains",
@@ -35,8 +43,18 @@ FEEDS = {
     "Kitco News":                  "https://www.kitco.com/rss/KitcoNews.xml",
     "Investing.com - Commodities": "https://www.investing.com/rss/commodities.rss",
     "Business Recorder - Commodities": "https://www.brecorder.com/feeds/news/1761",
-    # "Economic Times - Commodities": "<paste exact URL here>",
-    # "Moneycontrol - Commodities":   "<paste exact URL here>",
+    "Trading Economics":           "https://tradingeconomics.com/rss/news.aspx",
+
+    # --- Indian sources via Google News (headline + publisher + time;
+    #     no summary text). when:2d = last 2 days only. ---
+    "Economic Times":      gnews("(commodities OR gold OR silver OR crude OR copper) site:economictimes.indiatimes.com when:2d"),
+    "Moneycontrol":        gnews("(commodities OR gold OR silver OR crude OR MCX) site:moneycontrol.com when:2d"),
+    "Business Standard":   gnews("(commodities OR gold OR silver OR crude) site:business-standard.com when:2d"),
+    "Mint":                gnews("(commodities OR gold OR silver OR crude) site:livemint.com when:2d"),
+    "Hindu BusinessLine":  gnews("(commodities OR gold OR silver OR crude OR spices) site:thehindubusinessline.com when:2d"),
+    "MCX news":            gnews("MCX Multi Commodity Exchange when:2d"),
+    "NCDEX news":          gnews("NCDEX agri commodities when:2d"),
+    "Trading Economics (backup)": gnews("commodities site:tradingeconomics.com when:2d"),
 }
 
 KEYWORDS = [
@@ -103,11 +121,19 @@ def fetch_all():
             title = entry.get("title", "").strip()
             raw_summary = entry.get("summary", "")
             link = entry.get("link", "")
+            label = source
+            if "news.google.com" in url:
+                # Google titles look like "Headline - Publisher"; show the
+                # real publisher and drop the redundant summary.
+                if " - " in title:
+                    title, publisher = title.rsplit(" - ", 1)
+                    label = publisher.strip()
+                raw_summary = ""
             published_struct = entry.get("published_parsed") or entry.get("updated_parsed")
             if not matches_keywords(title, raw_summary):
                 continue
             items.append({
-                "source": source,
+                "source": label,
                 "title": title,
                 "summary": clean_summary(raw_summary, title),
                 "link": link,
