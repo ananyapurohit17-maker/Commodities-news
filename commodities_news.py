@@ -135,7 +135,6 @@ DATE_RE = [
     re.compile(r'<meta[^>]+(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished|pubdate|publishdate)["\'][^>]*?content=["\']([^"\']+)', re.I),
     re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished)["\']', re.I),
     re.compile(r'"datePublished"\s*:\s*"([^"]+)"', re.I),
-    re.compile(r'<time[^>]+datetime=["\']([^"\']+)["\']', re.I),
 ]
 
 def fetch_article_info(gurl):
@@ -163,6 +162,11 @@ def fetch_article_info(gurl):
             if d:
                 info["pub"] = d.isoformat()
                 break
+        if not info["pub"]:
+            m = re.search(r'/(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?:[/-]|$)', real)
+            if m:
+                y, mo, dd = map(int, m.groups())
+                info["pub"] = datetime(y, mo, dd, tzinfo=IST).astimezone(timezone.utc).isoformat()
     except Exception:
         pass
     return info
@@ -170,7 +174,8 @@ def fetch_article_info(gurl):
 def load_cache():
     try:
         with open(CACHE, encoding="utf-8") as f:
-            return json.load(f)
+            c = json.load(f)
+        return c if c.get("_v") == 3 else {}
     except Exception:
         return {}
 
@@ -224,6 +229,9 @@ def fetch_all():
         if (info is None or "pub" not in info) and fetched < MAX_ENRICH_PER_RUN:
             info = cache[it["glink"]] = fetch_article_info(it["glink"])
             fetched += 1
+            if not info.get("pub") and fetched <= 40:
+                print(f"[date?] no date: {it['source']} | {it['title'][:45]} | "
+                      f"{info.get('url') or 'link decode failed'}")
         if info:
             it["summary"] = clean_summary(info.get("summary", ""), it["title"])
             if info.get("url"):
@@ -235,7 +243,7 @@ def fetch_all():
         keep = {i["glink"] for i in out if i["google"]}
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump({k: v for k, v in cache.items() if k in keep}, f)
+            json.dump({"_v": 3, **{k: v for k, v in cache.items() if k in keep}}, f)
     except Exception:
         pass
 
@@ -245,7 +253,7 @@ def fetch_all():
     g = [i for i in out if i["google"]]
     print(f"Google News stories with verified dates: {sum(i['verified'] for i in g)}/{len(g)}")
     for i in out:
-        i["ago"] = ("" if i["verified"] else "~") + time_ago(i["dt"])
+        i["ago"] = time_ago(i["dt"]) if i["verified"] else "date unverified"
     return out
 
 # ---- page --------------------------------------------------------------
@@ -304,7 +312,7 @@ def write_html(items):
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta http-equiv="refresh" content="1800"><title>Commodities News</title>'
             f'<style>{CSS}</style></head><body><header><h1>Commodities News</h1>'
-            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · “~” = approximate time</div></header>'
+            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · “date unverified” = publisher date could not be read</div></header>'
             f'<div class="bar">{btns}</div><div class="wrap">{"".join(cards) or "<div class=empty>No stories right now.</div>"}</div>'
             f'<script>{JS}</script></body></html>')
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
