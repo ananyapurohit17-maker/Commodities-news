@@ -9,7 +9,7 @@ about (Gold, Silver, Crude Oil ...), shows a short summary, source and
 Local test:  pip install feedparser googlenewsdecoder
              python commodities_news.py   -> open docs/index.html
 """
-import feedparser, html, json, os, re, urllib.request
+import feedparser, html, json, os, re, threading, time, urllib.request
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
@@ -18,8 +18,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 OUT = "docs/index.html"
 CACHE = "docs/summary_cache.json"
 SUMMARY_MAX = 420          # ~3 sentences
-MAX_ENRICH_PER_RUN = 40    # article pages fetched per run (Google News items)
+MAX_ENRICH_PER_RUN = 30    # article pages fetched per run (Google News items)
 MAX_STORIES = 150
+ENRICH_BUDGET_SEC = 150     # hard stop for all article lookups per run
+PER_ARTICLE_SEC = 15       # give up on any single article after this
+MAX_CONSEC_FAILS = 6       # stop early if lookups keep failing (rate limit)
 MAX_AGE_DAYS = 5           # drop stories older than this (by real publish date)
 
 def gnews(q):
@@ -171,6 +174,14 @@ def fetch_article_info(gurl):
         pass
     return info
 
+def timed(fn, arg, seconds):
+    """Run fn(arg) but give up after `seconds` (a stuck lookup can't hang the run)."""
+    box = {}
+    t = threading.Thread(target=lambda: box.update(v=fn(arg)), daemon=True)
+    t.start()
+    t.join(seconds)
+    return box.get("v") or {"url": "", "summary": "", "pub": ""}
+
 def load_cache():
     try:
         with open(CACHE, encoding="utf-8") as f:
@@ -221,14 +232,17 @@ def fetch_all():
 
     # Google News stories: read summary + REAL publish date from the article
     # (Google's own timestamps are unreliable). Cached, capped per run.
-    cache, fetched = load_cache(), 0
+    cache, fetched, fails, t0 = load_cache(), 0, 0, time.time()
     for it in out:
         if not it["google"]:
             continue
         info = cache.get(it["glink"])
-        if (info is None or "pub" not in info) and fetched < MAX_ENRICH_PER_RUN:
-            info = cache[it["glink"]] = fetch_article_info(it["glink"])
+        in_budget = (fetched < MAX_ENRICH_PER_RUN and fails < MAX_CONSEC_FAILS
+                     and time.time() - t0 < ENRICH_BUDGET_SEC)
+        if (info is None or "pub" not in info) and in_budget:
+            info = cache[it["glink"]] = timed(fetch_article_info, it["glink"], PER_ARTICLE_SEC)
             fetched += 1
+            fails = 0 if info.get("url") else fails + 1
             if not info.get("pub") and fetched <= 40:
                 print(f"[date?] no date: {it['source']} | {it['title'][:45]} | "
                       f"{info.get('url') or 'link decode failed'}")
