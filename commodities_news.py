@@ -34,6 +34,13 @@ FEEDS = {
     "Investing.com":       "https://www.investing.com/rss/commodities.rss",
     "Business Recorder":   "https://www.brecorder.com/feeds/news/1761",
     "Trading Economics":   "https://tradingeconomics.com/rss/news.aspx",
+    # Indian publishers' own feeds (these carry a short description)
+    "Economic Times - Commodities": "https://economictimes.indiatimes.com/markets/commodities/rssfeeds/1808152121.cms",
+    "Economic Times - Markets":     "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    "BusinessLine - Commodities":   "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
+    "BusinessLine - Gold & Silver": "https://www.thehindubusinessline.com/markets/gold/feeder/default.rss",
+    "BusinessLine - Commodity Analysis": "https://www.thehindubusinessline.com/portfolio/commodity-analysis/feeder/default.rss",
+    "BusinessLine - Agri":          "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
     # Indian sources via Google News (last 2 days)
     "Economic Times":     gnews("(commodities OR gold OR silver OR crude OR copper) site:economictimes.indiatimes.com when:2d"),
     "Moneycontrol":       gnews("(commodities OR gold OR silver OR crude OR MCX) site:moneycontrol.com when:2d"),
@@ -163,14 +170,12 @@ def fetch_all():
                           "summary": clean_summary(raw, title), "tags": tags,
                           "ago": time_ago(st), "sort": st or (1970, 1, 1, 0, 0, 0, 0, 0, 0),
                           "google": is_g})
-    seen, out = set(), []
+    best = {}
     for it in sorted(items, key=lambda x: x["sort"], reverse=True):
         k = re.sub(r"[^a-z0-9]", "", it["title"].lower())
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(it)
-    out = out[:MAX_STORIES]
+        if k not in best or (it["summary"] and not best[k]["summary"]):
+            best[k] = it
+    out = sorted(best.values(), key=lambda x: x["sort"], reverse=True)[:MAX_STORIES]
 
     # fill in summaries for Google News stories (cached, capped per run)
     cache, fetched = load_cache(), 0
@@ -257,7 +262,8 @@ def write_html(items):
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(page)
-    print(f"Wrote {len(items)} stories to {OUT}")
+    with_sum = sum(1 for i in items if i["summary"])
+    print(f"Wrote {len(items)} stories to {OUT} ({with_sum} with summaries)")
 
 if __name__ == "__main__":
     write_html(fetch_all())
