@@ -70,7 +70,7 @@ TAGS = {
 AGRI_CONTEXT = r"price|futures|export|import|crop|supply|demand|msp|mcx|ncdex|mandi|rally|output|production|stocks|harvest|acreage|sowing|monsoon|tonnes|quintal|bushel|contract|duty"
 NON_CRUDE_OIL = r"(palm|edible|cooking|mustard|soy|soybean|olive|coconut|sunflower|vegetable|castor) oil"
 GENERIC = r"commodit|\bmcx\b|\bncdex\b"
-EXCLUDE = r"medal|asiad|olympic|asian games|bronze|athlet|cricket|tournament|gold coast|silver screen|box office|movie|film\b|actor|bollywood"
+EXCLUDE = r"gold (international|finance|loan|ltd|limited|corp)|newborn|welfare scheme|medal|asiad|olympic|asian games|bronze|athlet|cricket|tournament|gold coast|silver screen|box office|movie|film\b|actor|bollywood"
 
 def tag_story(title, summary):
     if re.search(EXCLUDE, title, re.I):
@@ -267,7 +267,7 @@ def fetch_all():
     g = [i for i in out if i["google"]]
     print(f"Google News stories with verified dates: {sum(i['verified'] for i in g)}/{len(g)}")
     for i in out:
-        i["ago"] = time_ago(i["dt"]) if i["verified"] else "date unverified"
+        i["ago"] = time_ago(i["dt"]) if i["verified"] else "~" + time_ago(i["dt"])
     return out
 
 # ---- page --------------------------------------------------------------
@@ -326,7 +326,7 @@ def write_html(items):
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta http-equiv="refresh" content="1800"><title>Commodities News</title>'
             f'<style>{CSS}</style></head><body><header><h1>Commodities News</h1>'
-            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · “date unverified” = publisher date could not be read</div></header>'
+            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · “~” = approximate time (from Google News)</div></header>'
             f'<div class="bar">{btns}</div><div class="wrap">{"".join(cards) or "<div class=empty>No stories right now.</div>"}</div>'
             f'<script>{JS}</script></body></html>')
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
