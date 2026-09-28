@@ -10,6 +10,7 @@ Local test:  pip install feedparser googlenewsdecoder
              python commodities_news.py   -> open docs/index.html
 """
 import feedparser, html, json, os, re, urllib.request
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 
@@ -17,8 +18,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 OUT = "docs/index.html"
 CACHE = "docs/summary_cache.json"
 SUMMARY_MAX = 420          # ~3 sentences
-MAX_ENRICH_PER_RUN = 25    # article pages fetched per run (Google News items)
+MAX_ENRICH_PER_RUN = 40    # article pages fetched per run (Google News items)
 MAX_STORIES = 150
+MAX_AGE_DAYS = 5           # drop stories older than this (by real publish date)
 
 def gnews(q):
     return ("https://news.google.com/rss/search?q=" + quote_plus(q)
@@ -96,10 +98,10 @@ def clean_summary(raw, title):
         text = cut[:end + 1] if end > SUMMARY_MAX * 0.5 else cut.rsplit(" ", 1)[0] + "…"
     return text
 
-def time_ago(st):
-    if not st:
+def time_ago(dt):
+    if not dt:
         return "unknown time"
-    s = (datetime.now(timezone.utc) - datetime(*st[:6], tzinfo=timezone.utc)).total_seconds()
+    s = (datetime.now(timezone.utc) - dt).total_seconds()
     if s < 60:
         return "just now"
     if s < 3600:
@@ -108,30 +110,62 @@ def time_ago(st):
         return f"{int(s // 3600)} hr ago"
     return f"{int(s // 86400)} days ago"
 
+def parse_dt(txt):
+    """Parse ISO / RFC dates from article pages -> aware UTC datetime."""
+    if not txt:
+        return None
+    txt = txt.strip()
+    try:
+        d = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            d = parsedate_to_datetime(txt)
+        except Exception:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=IST)
+    d = d.astimezone(timezone.utc)
+    return None if d > datetime.now(timezone.utc) + timedelta(days=1) else d
+
 META_RE = [
     re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]*?content=["\']([^"\']+)', re.I),
     re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name)=["\'](?:og:description|description)["\']', re.I),
 ]
+DATE_RE = [
+    re.compile(r'<meta[^>]+(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished|pubdate|publishdate)["\'][^>]*?content=["\']([^"\']+)', re.I),
+    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished)["\']', re.I),
+    re.compile(r'"datePublished"\s*:\s*"([^"]+)"', re.I),
+    re.compile(r'<time[^>]+datetime=["\']([^"\']+)["\']', re.I),
+]
 
 def fetch_article_info(gurl):
-    """Best effort: decode the Google News link, read the article's meta
-    description. Any failure just returns no summary."""
+    """Best effort: decode the Google News link, then read the article's
+    summary and REAL publish date. Any failure just returns blanks."""
+    info = {"url": "", "summary": "", "pub": ""}
     try:
         from googlenewsdecoder import gnewsdecoder
         res = gnewsdecoder(gurl, interval=1)
         real = res.get("decoded_url") if res.get("status") else ""
         if not real:
-            return {"url": "", "summary": ""}
+            return info
+        info["url"] = real
         req = urllib.request.Request(real, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            page = r.read(250000).decode("utf-8", "ignore")
+            page = r.read(300000).decode("utf-8", "ignore")
         for rx in META_RE:
             m = rx.search(page)
             if m:
-                return {"url": real, "summary": html.unescape(m.group(1)).strip()}
-        return {"url": real, "summary": ""}
+                info["summary"] = html.unescape(m.group(1)).strip()
+                break
+        for rx in DATE_RE:
+            m = rx.search(page)
+            d = parse_dt(html.unescape(m.group(1))) if m else None
+            if d:
+                info["pub"] = d.isoformat()
+                break
     except Exception:
-        return {"url": "", "summary": ""}
+        pass
+    return info
 
 def load_cache():
     try:
@@ -141,6 +175,8 @@ def load_cache():
         return {}
 
 # ---- fetch -------------------------------------------------------------
+MIN_DT = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 def fetch_all():
     items = []
     for source, url in FEEDS.items():
@@ -166,38 +202,50 @@ def fetch_all():
             if not tags:
                 continue
             st = e.get("published_parsed") or e.get("updated_parsed")
-            items.append({"source": label, "title": title, "link": e.get("link", ""),
+            dt = datetime(*st[:6], tzinfo=timezone.utc) if st else None
+            link = e.get("link", "")
+            items.append({"source": label, "title": title, "link": link, "glink": link,
                           "summary": clean_summary(raw, title), "tags": tags,
-                          "ago": time_ago(st), "sort": st or (1970, 1, 1, 0, 0, 0, 0, 0, 0),
-                          "google": is_g})
+                          "dt": dt, "verified": not is_g, "google": is_g})
     best = {}
-    for it in sorted(items, key=lambda x: x["sort"], reverse=True):
+    for it in sorted(items, key=lambda x: x["dt"] or MIN_DT, reverse=True):
         k = re.sub(r"[^a-z0-9]", "", it["title"].lower())
         if k not in best or (it["summary"] and not best[k]["summary"]):
             best[k] = it
-    out = sorted(best.values(), key=lambda x: x["sort"], reverse=True)[:MAX_STORIES]
+    out = sorted(best.values(), key=lambda x: x["dt"] or MIN_DT, reverse=True)[:MAX_STORIES + 60]
 
-    # fill in summaries for Google News stories (cached, capped per run)
+    # Google News stories: read summary + REAL publish date from the article
+    # (Google's own timestamps are unreliable). Cached, capped per run.
     cache, fetched = load_cache(), 0
     for it in out:
         if not it["google"]:
             continue
-        info = cache.get(it["link"])
-        if info is None and fetched < MAX_ENRICH_PER_RUN:
-            info = cache[it["link"]] = fetch_article_info(it["link"])
+        info = cache.get(it["glink"])
+        if (info is None or "pub" not in info) and fetched < MAX_ENRICH_PER_RUN:
+            info = cache[it["glink"]] = fetch_article_info(it["glink"])
             fetched += 1
         if info:
             it["summary"] = clean_summary(info.get("summary", ""), it["title"])
             if info.get("url"):
                 it["link"] = info["url"]
-    keep = {it["link"] for it in out} | {k for k in cache if k in {i["link"] for i in out}}
+            pub = parse_dt(info.get("pub", ""))
+            if pub:
+                it["dt"], it["verified"] = pub, True
     try:
+        keep = {i["glink"] for i in out if i["google"]}
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump({k: v for k, v in cache.items()
-                       if k in {i["link"] for i in out} or len(cache) < 400}, f)
+            json.dump({k: v for k, v in cache.items() if k in keep}, f)
     except Exception:
         pass
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
+    out = [i for i in out if i["dt"] is None or i["dt"] >= cutoff]
+    out = sorted(out, key=lambda x: x["dt"] or MIN_DT, reverse=True)[:MAX_STORIES]
+    g = [i for i in out if i["google"]]
+    print(f"Google News stories with verified dates: {sum(i['verified'] for i in g)}/{len(g)}")
+    for i in out:
+        i["ago"] = ("" if i["verified"] else "~") + time_ago(i["dt"])
     return out
 
 # ---- page --------------------------------------------------------------
@@ -256,7 +304,7 @@ def write_html(items):
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta http-equiv="refresh" content="1800"><title>Commodities News</title>'
             f'<style>{CSS}</style></head><body><header><h1>Commodities News</h1>'
-            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min</div></header>'
+            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · “~” = approximate time</div></header>'
             f'<div class="bar">{btns}</div><div class="wrap">{"".join(cards) or "<div class=empty>No stories right now.</div>"}</div>'
             f'<script>{JS}</script></body></html>')
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
