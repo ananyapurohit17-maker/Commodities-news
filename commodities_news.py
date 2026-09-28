@@ -122,6 +122,25 @@ FEEDS = {
         gnews('"NCDEX" agri commodities when:2d'),
     "Trading Economics (backup)":
         gnews('commodities site:tradingeconomics.com when:2d'),
+
+    "ALCircle":
+        gnews('(aluminium OR aluminum OR alumina OR bauxite OR smelter) site:alcircle.com when:3d'),
+    "International Aluminium Institute":
+        gnews('(aluminium OR aluminum OR alumina OR bauxite OR primary aluminium OR smelter) site:international-aluminium.org when:7d'),
+    "SMM / Metal.com":
+        gnews('(aluminium OR aluminum OR copper OR zinc OR nickel OR lead OR tin OR iron ore OR steel) site:news.metal.com when:3d'),
+    "Fibre2Fashion":
+        gnews('(cotton OR cotton yarn OR cotton crop OR cotton sowing OR cotton prices) site:fibre2fashion.com/news when:3d'),
+    "Agriwatch":
+        gnews('(cotton OR guar OR turmeric OR jeera OR cumin OR sugar OR wheat OR soybean OR maize OR rice OR mustard OR palm oil) site:agriwatch.com when:3d'),
+    "IEA":
+        gnews('(oil OR crude OR natural gas OR LNG OR refinery OR diesel OR gasoline OR energy market) site:iea.org/news when:7d'),
+    "Forex Factory":
+        gnews('(gold OR silver OR crude oil OR brent OR WTI OR natural gas OR LNG OR copper OR aluminium OR aluminum OR zinc OR wheat OR cotton OR sugar) site:forexfactory.com/news when:2d'),
+    "ChiniMandi":
+        gnews('(sugar OR ethanol OR cane OR sugarcane OR molasses OR sugar production OR sugar exports) site:chinimandi.com when:3d'),
+    "USDA":
+        gnews('(cotton OR wheat OR corn OR maize OR soybeans OR rice OR sugar OR crop OR production OR exports OR stocks OR acreage OR yield) site:usda.gov when:7d'),
 }
 
 
@@ -172,37 +191,61 @@ GENERIC_COMMODITY = r"\bcommodit(?:y|ies)\b|\bmcx\b|\bncdex\b|\blme\b"
 EXCLUDE = (
     r"gold (international|finance|loan|ltd|limited|corp)|newborn|welfare scheme|"
     r"medal|asiad|olympic|asian games|bronze|athlet|cricket|tournament|gold coast|"
-    r"silver screen|box office|movie|film\b|actor|bollywood"
+    r"silver screen|box office|movie|film\b|actor|bollywood|"
+    r"\bipo\b|initial public offering|share allotment|listing gains?|listing premium|"
+    r"grey market premium|\bgmp\b|subscription status|"
+    r"\bstock (price|market|markets|split|buyback|dividend)\b|"
+    r"\bshares? (rise|rises|fall|falls|jump|jumps|surge|surges|drop|drops|gain|gains)\b|"
+    r"\bquarterly results?\b|\bearnings\b|\bprofit after tax\b|\bnet profit\b|"
+    r"\brevenue (rose|fell|rises|falls|growth)\b|\bebitda\b|\bdividend\b|"
+    r"\bmutual funds?\b|\bsensex\b|\bnifty\b|\bbse\b|\bnse\b"
 )
 
 
 def classify_story(title, summary):
-    if re.search(EXCLUDE, title, re.I):
+    """Keep only genuine commodity-market stories."""
+    title_l = title.lower()
+    text = f"{title} {summary}".lower()
+
+    if re.search(EXCLUDE, text, re.I):
         return [], "Other"
 
-    text = f"{title} {summary}".lower()
-    tags = []
-
+    title_tags = []
     for name, pattern in SPECIFIC_TAGS.items():
-        if re.search(pattern, text, re.I):
-            if name in AGRI_TAGS and not re.search(AGRI_CONTEXT, text, re.I):
-                continue
-            tags.append(name)
+        if re.search(pattern, title_l, re.I):
+            title_tags.append(name)
 
-    # Preserve useful ordering and avoid too many chips.
+    generic_title = re.search(GENERIC_COMMODITY, title_l, re.I)
+
+    # Commodity keyword must be in the headline, not merely buried in summary.
+    if not title_tags and not generic_title:
+        return [], "Other"
+
+    # Agriculture stories need clear commodity/crop/market context.
+    if title_tags and any(tag in AGRI_TAGS for tag in title_tags):
+        if not re.search(AGRI_CONTEXT, text, re.I):
+            return [], "Other"
+
+    # Reject equity/IPO/corporate-result headlines.
+    if re.search(
+        r"\b(ipo|stock|stocks|shares|equity|equities|sensex|nifty|dividend|"
+        r"earnings|quarterly results|market cap|brokerage target|price target)\b",
+        title_l, re.I
+    ):
+        return [], "Other"
+
     seen = set()
-    tags = [x for x in tags if not (x in seen or seen.add(x))][:3]
+    tags = [x for x in title_tags if not (x in seen or seen.add(x))][:3]
 
-    if any(t in AGRI_TAGS for t in tags):
+    if any(x in AGRI_TAGS for x in tags):
         group = "Agri"
-    elif any(t in ENERGY_TAGS for t in tags):
+    elif any(x in ENERGY_TAGS for x in tags):
         group = "Energy"
-    elif any(t in METAL_TAGS for t in tags):
+    elif any(x in METAL_TAGS for x in tags):
         group = "Metals"
-    elif re.search(GENERIC_COMMODITY, text, re.I):
+    elif generic_title:
         group = "Commodities"
-        if not tags:
-            tags = ["Commodities"]
+        tags = ["Commodities"]
     else:
         return [], "Other"
 
