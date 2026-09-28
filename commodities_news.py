@@ -1,123 +1,246 @@
 #!/usr/bin/env python3
 """
-Commodities News Aggregator -> docs/index.html (hosted on GitHub Pages)
+Commodity News Dashboard -> docs/index.html
 
-Pulls RSS + Google News feeds, tags each story with the commodity it is
-about (Gold, Silver, Crude Oil ...), shows a short summary, source and
-"X ago" time, and builds a filterable card page.
-
-Local test:  pip install feedparser googlenewsdecoder
-             python commodities_news.py   -> open docs/index.html
+Features
+--------
+- Aggregates commodity news from publisher RSS + Google News discovery.
+- Reuters is included through Google News site:reuters.com discovery.
+- Verifies publisher dates for Google News-discovered stories before showing them.
+- Drops stories older than MAX_AGE_DAYS.
+- Displays exact IST publication time + relative age.
+- Professional Trading-Economics-inspired dashboard:
+  hero story, latest-news grid, commodity/source/time filters, sidebar.
+- Extracts publisher og:image where available.
 """
-import feedparser, html, json, os, re, threading, time, urllib.request
-from email.utils import parsedate_to_datetime
+
+import feedparser
+import html
+import json
+import os
+import re
+import threading
+import time
+import urllib.request
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus, urlparse
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
 OUT = "docs/index.html"
 CACHE = "docs/summary_cache.json"
-SUMMARY_MAX = 420          # ~3 sentences
-MAX_ENRICH_PER_RUN = 80    # try to verify more Google News article dates per run
-MAX_STORIES = 150
-ENRICH_BUDGET_SEC = 150     # hard stop for all article lookups per run
-PER_ARTICLE_SEC = 15       # give up on any single article after this
-MAX_CONSEC_FAILS = 6       # stop early if lookups keep failing (rate limit)
-MAX_AGE_DAYS = 5           # drop stories older than this (by real publish date)
+
+SUMMARY_MAX = 430
+MAX_STORIES = 180
+MAX_AGE_DAYS = 5
+
+# Google News items must be publisher-verified before display.
+MAX_ENRICH_PER_RUN = 100
+ENRICH_BUDGET_SEC = 220
+PER_ARTICLE_SEC = 12
+MAX_CONSEC_FAILS = 10
+
+CACHE_VERSION = 5
+
+
+# ---------------------------------------------------------------------
+# FEEDS
+# ---------------------------------------------------------------------
 
 def gnews(q):
-    return ("https://news.google.com/rss/search?q=" + quote_plus(q)
-            + "&hl=en-IN&gl=IN&ceid=IN:en")
+    return (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(q)
+        + "&hl=en-IN&gl=IN&ceid=IN:en"
+    )
+
 
 FEEDS = {
-    "Barchart - Metals":   "https://www.barchart.com/news/rss/commodities/metals",
+    # Direct commodity feeds
+    "Barchart - Metals": "https://www.barchart.com/news/rss/commodities/metals",
     "Barchart - Energies": "https://www.barchart.com/news/rss/commodities/energies",
-    "Barchart - Grains":   "https://www.barchart.com/news/rss/commodities/grains",
-    "Barchart - Softs":    "https://www.barchart.com/news/rss/commodities/softs",
-    "SCMP - Commodities":  "https://www.scmp.com/rss/265840/feed",
-    "Kitco News":          "https://www.kitco.com/rss/KitcoNews.xml",
-    "Investing.com":       "https://www.investing.com/rss/commodities.rss",
-    "Business Recorder":   "https://www.brecorder.com/feeds/news/1761",
-    "Trading Economics":   "https://tradingeconomics.com/rss/news.aspx",
-    # Indian publishers' own feeds (these carry a short description)
-    "Economic Times - Commodities": "https://economictimes.indiatimes.com/markets/commodities/rssfeeds/1808152121.cms",
-    "Economic Times - Markets":     "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-    "BusinessLine - Commodities":   "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
-    "BusinessLine - Gold & Silver": "https://www.thehindubusinessline.com/markets/gold/feeder/default.rss",
-    "BusinessLine - Commodity Analysis": "https://www.thehindubusinessline.com/portfolio/commodity-analysis/feeder/default.rss",
-    "BusinessLine - Agri":          "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
-    # Indian sources via Google News (last 2 days)
-    "Economic Times":     gnews("(commodities OR gold OR silver OR crude OR copper) site:economictimes.indiatimes.com when:2d"),
-    "Moneycontrol":       gnews("(commodities OR gold OR silver OR crude OR MCX) site:moneycontrol.com when:2d"),
-    "Business Standard":  gnews("(commodities OR gold OR silver OR crude) site:business-standard.com when:2d"),
-    "Mint":               gnews("(commodities OR gold OR silver OR crude) site:livemint.com when:2d"),
-    "Hindu BusinessLine": gnews("(commodities OR gold OR silver OR crude OR spices) site:thehindubusinessline.com when:2d"),
-    "MCX news":           gnews("MCX Multi Commodity Exchange when:2d"),
-    "NCDEX news":         gnews("NCDEX agri commodities when:2d"),
-    "Trading Economics (backup)": gnews("commodities site:tradingeconomics.com when:2d"),
+    "Barchart - Grains": "https://www.barchart.com/news/rss/commodities/grains",
+    "Barchart - Softs": "https://www.barchart.com/news/rss/commodities/softs",
+    "Kitco": "https://www.kitco.com/rss/KitcoNews.xml",
+    "Investing.com": "https://www.investing.com/rss/commodities.rss",
+    "Business Recorder": "https://www.brecorder.com/feeds/news/1761",
+    "Trading Economics": "https://tradingeconomics.com/rss/news.aspx",
+
+    # Indian publisher feeds
+    "Economic Times - Commodities":
+        "https://economictimes.indiatimes.com/markets/commodities/rssfeeds/1808152121.cms",
+    "Economic Times - Markets":
+        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    "BusinessLine - Commodities":
+        "https://www.thehindubusinessline.com/markets/commodities/feeder/default.rss",
+    "BusinessLine - Gold & Silver":
+        "https://www.thehindubusinessline.com/markets/gold/feeder/default.rss",
+    "BusinessLine - Commodity Analysis":
+        "https://www.thehindubusinessline.com/portfolio/commodity-analysis/feeder/default.rss",
+    "BusinessLine - Agri":
+        "https://www.thehindubusinessline.com/economy/agri-business/feeder/default.rss",
+
+    # Google News discovery. Real publisher date is verified later.
+    "Reuters":
+        gnews(
+            '(gold OR silver OR crude OR oil OR natural gas OR LNG OR copper OR '
+            'aluminium OR aluminum OR zinc OR nickel OR iron ore OR steel OR '
+            'cotton OR wheat OR sugar OR soybean OR corn OR rice OR palm oil OR '
+            'coffee OR cocoa OR turmeric OR cumin OR jeera OR guar) '
+            'site:reuters.com when:2d'
+        ),
+    "Economic Times":
+        gnews(
+            '(commodities OR gold OR silver OR crude OR copper OR cotton OR '
+            'turmeric OR jeera OR guar OR sugar OR wheat) '
+            'site:economictimes.indiatimes.com when:2d'
+        ),
+    "Moneycontrol":
+        gnews(
+            '(commodities OR gold OR silver OR crude OR MCX OR NCDEX OR cotton OR '
+            'turmeric OR jeera OR guar) site:moneycontrol.com when:2d'
+        ),
+    "Business Standard":
+        gnews(
+            '(commodities OR gold OR silver OR crude OR metals OR agriculture) '
+            'site:business-standard.com when:2d'
+        ),
+    "Mint":
+        gnews(
+            '(commodities OR gold OR silver OR crude OR metals) '
+            'site:livemint.com when:2d'
+        ),
+    "Hindu BusinessLine":
+        gnews(
+            '(commodities OR gold OR silver OR crude OR spices OR cotton OR '
+            'turmeric OR jeera OR guar) site:thehindubusinessline.com when:2d'
+        ),
+    "MCX":
+        gnews('"MCX" "Multi Commodity Exchange" when:2d'),
+    "NCDEX":
+        gnews('"NCDEX" agri commodities when:2d'),
+    "Trading Economics (backup)":
+        gnews('commodities site:tradingeconomics.com when:2d'),
 }
 
-# ---- commodity tagging ------------------------------------------------
-TAGS = {
-    "Gold":        r"\bgold\b|bullion",
-    "Silver":      r"\bsilver\b",
-    "Crude Oil":   r"\bcrude\b|\bbrent\b|\bwti\b|\bopec\b|\boil\b",
-    "Natural Gas": r"natural gas|\blng\b|\bttf\b|henry hub",
-    "Copper":      r"\bcopper\b",
-    "Base Metals": r"alumini?um|\bzinc\b|\bnickel\b|iron ore|\bsteel\b|base metal|\blme\b",
-    "Agri":        r"wheat|sugar|cotton|soy?abean|\bcorn\b|maize|\brice\b|palm oil|edible oil|coffee|cocoa|turmeric|jeera|cumin|guar|mentha|cardamom|pepper|spices|castor|chana|mustard|rapeseed|canola|oilseed|pulses",
-}
-AGRI_CONTEXT = r"price|futures|export|import|crop|supply|demand|msp|mcx|ncdex|mandi|rally|output|production|stocks|harvest|acreage|sowing|monsoon|tonnes|quintal|bushel|contract|duty"
-NON_CRUDE_OIL = r"(palm|edible|cooking|mustard|soy|soybean|olive|coconut|sunflower|vegetable|castor) oil"
-GENERIC = r"commodit|\bmcx\b|\bncdex\b"
-EXCLUDE = r"gold (international|finance|loan|ltd|limited|corp)|newborn|welfare scheme|medal|asiad|olympic|asian games|bronze|athlet|cricket|tournament|gold coast|silver screen|box office|movie|film\b|actor|bollywood"
 
-def tag_story(title, summary):
+# ---------------------------------------------------------------------
+# CLASSIFICATION
+# ---------------------------------------------------------------------
+
+SPECIFIC_TAGS = {
+    "Gold": r"\bgold\b|bullion",
+    "Silver": r"\bsilver\b",
+    "Crude Oil": r"\bcrude\b|\bbrent\b|\bwti\b|\bopec\+?\b|\boil prices?\b",
+    "Natural Gas": r"\bnatural gas\b|\blng\b|\bttf\b|henry hub",
+    "Copper": r"\bcopper\b",
+    "Aluminium": r"\balumini?um\b",
+    "Zinc": r"\bzinc\b",
+    "Nickel": r"\bnickel\b",
+    "Steel": r"\bsteel\b|\biron ore\b",
+    "Cotton": r"\bcotton\b",
+    "Guar": r"\bguar\b",
+    "Turmeric": r"\bturmeric\b|\bhaldi\b",
+    "Jeera": r"\bjeera\b|\bcumin\b",
+    "Sugar": r"\bsugar\b",
+    "Wheat": r"\bwheat\b",
+    "Soybean": r"\bsoybeans?\b|\bsoya\b",
+    "Corn": r"\bcorn\b|\bmaize\b",
+    "Rice": r"\brice\b",
+    "Mustard": r"\bmustard\b|\brapeseed\b|\bcanola\b",
+    "Palm Oil": r"\bpalm oil\b",
+    "Coffee": r"\bcoffee\b",
+    "Cocoa": r"\bcocoa\b",
+}
+
+AGRI_TAGS = {
+    "Cotton", "Guar", "Turmeric", "Jeera", "Sugar", "Wheat",
+    "Soybean", "Corn", "Rice", "Mustard", "Palm Oil", "Coffee", "Cocoa",
+}
+METAL_TAGS = {"Gold", "Silver", "Copper", "Aluminium", "Zinc", "Nickel", "Steel"}
+ENERGY_TAGS = {"Crude Oil", "Natural Gas"}
+
+AGRI_CONTEXT = (
+    r"price|futures|export|import|crop|supply|demand|msp|mcx|ncdex|mandi|"
+    r"rally|output|production|stocks|harvest|acreage|sowing|monsoon|tonnes|"
+    r"quintal|bushel|contract|duty|yield|inventory|shipment|weather"
+)
+
+GENERIC_COMMODITY = r"\bcommodit(?:y|ies)\b|\bmcx\b|\bncdex\b|\blme\b"
+
+EXCLUDE = (
+    r"gold (international|finance|loan|ltd|limited|corp)|newborn|welfare scheme|"
+    r"medal|asiad|olympic|asian games|bronze|athlet|cricket|tournament|gold coast|"
+    r"silver screen|box office|movie|film\b|actor|bollywood"
+)
+
+
+def classify_story(title, summary):
     if re.search(EXCLUDE, title, re.I):
-        return []
+        return [], "Other"
+
     text = f"{title} {summary}".lower()
     tags = []
-    for name, pat in TAGS.items():
-        t = re.sub(NON_CRUDE_OIL, "", text) if name == "Crude Oil" else text
-        if re.search(pat, t):
-            if name == "Agri" and not re.search(AGRI_CONTEXT, text):
+
+    for name, pattern in SPECIFIC_TAGS.items():
+        if re.search(pattern, text, re.I):
+            if name in AGRI_TAGS and not re.search(AGRI_CONTEXT, text, re.I):
                 continue
             tags.append(name)
-    if not tags and re.search(GENERIC, text):
-        tags.append("Commodities")
-    return tags[:2]
 
-# ---- helpers -----------------------------------------------------------
+    # Preserve useful ordering and avoid too many chips.
+    seen = set()
+    tags = [x for x in tags if not (x in seen or seen.add(x))][:3]
+
+    if any(t in AGRI_TAGS for t in tags):
+        group = "Agri"
+    elif any(t in ENERGY_TAGS for t in tags):
+        group = "Energy"
+    elif any(t in METAL_TAGS for t in tags):
+        group = "Metals"
+    elif re.search(GENERIC_COMMODITY, text, re.I):
+        group = "Commodities"
+        if not tags:
+            tags = ["Commodities"]
+    else:
+        return [], "Other"
+
+    return tags, group
+
+
+# ---------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------
+
 TAG_RE = re.compile(r"<[^>]+>")
 
+
+def strip_html(value):
+    return html.unescape(TAG_RE.sub(" ", value or ""))
+
+
 def clean_summary(raw, title):
-    text = html.unescape(TAG_RE.sub(" ", raw or ""))
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", strip_html(raw)).strip()
     if not text or text.lower() == title.lower().strip():
         return ""
     if len(text) > SUMMARY_MAX:
         cut = text[:SUMMARY_MAX]
         end = cut.rfind(". ")
-        text = cut[:end + 1] if end > SUMMARY_MAX * 0.5 else cut.rsplit(" ", 1)[0] + "…"
+        text = (
+            cut[: end + 1]
+            if end > SUMMARY_MAX * 0.55
+            else cut.rsplit(" ", 1)[0] + "…"
+        )
     return text
 
-def time_ago(dt):
-    if not dt:
-        return "unknown time"
-    s = (datetime.now(timezone.utc) - dt).total_seconds()
-    if s < 60:
-        return "just now"
-    if s < 3600:
-        return f"{int(s // 60)} min ago"
-    if s < 86400:
-        return f"{int(s // 3600)} hr ago"
-    return f"{int(s // 86400)} days ago"
 
 def parse_dt(txt):
-    """Parse ISO / RFC dates from article pages -> aware UTC datetime."""
+    """Parse common ISO/RFC publisher dates and return aware UTC datetime."""
     if not txt:
         return None
-    txt = txt.strip()
+
+    txt = str(txt).strip()
     try:
         d = datetime.fromisoformat(txt.replace("Z", "+00:00"))
     except Exception:
@@ -125,230 +248,1019 @@ def parse_dt(txt):
             d = parsedate_to_datetime(txt)
         except Exception:
             return None
+
     if d.tzinfo is None:
         d = d.replace(tzinfo=IST)
-    d = d.astimezone(timezone.utc)
-    return None if d > datetime.now(timezone.utc) + timedelta(days=1) else d
 
-META_RE = [
-    re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]*?content=["\']([^"\']+)', re.I),
-    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name)=["\'](?:og:description|description)["\']', re.I),
+    d = d.astimezone(timezone.utc)
+
+    # Reject implausible future dates.
+    if d > datetime.now(timezone.utc) + timedelta(hours=12):
+        return None
+    return d
+
+
+def time_ago(dt):
+    if not dt:
+        return "Unknown time"
+
+    seconds = max(0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+    if seconds < 60:
+        return "Just now"
+    if seconds < 3600:
+        n = int(seconds // 60)
+        return f"{n} min ago"
+    if seconds < 86400:
+        n = int(seconds // 3600)
+        return f"{n} hr ago"
+    n = int(seconds // 86400)
+    return f"{n} day{'s' if n != 1 else ''} ago"
+
+
+def source_domain(url):
+    try:
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        return domain
+    except Exception:
+        return ""
+
+
+def source_short(name):
+    name = re.sub(r"\s+\(backup\)$", "", name, flags=re.I)
+    name = re.sub(r"\s+-\s+.*$", "", name)
+    return name.strip()
+
+
+def entry_image(entry):
+    """Best effort RSS image extraction."""
+    try:
+        media = entry.get("media_content") or []
+        if media and media[0].get("url"):
+            return media[0]["url"]
+    except Exception:
+        pass
+
+    try:
+        thumbs = entry.get("media_thumbnail") or []
+        if thumbs and thumbs[0].get("url"):
+            return thumbs[0]["url"]
+    except Exception:
+        pass
+
+    try:
+        for enclosure in entry.get("enclosures", []):
+            if enclosure.get("type", "").startswith("image/") and enclosure.get("href"):
+                return enclosure["href"]
+    except Exception:
+        pass
+
+    return ""
+
+
+META_DESC_RE = [
+    re.compile(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:description|description|twitter:description)["\'][^>]*?content=["\']([^"\']+)',
+        re.I,
+    ),
+    re.compile(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name)=["\'](?:og:description|description|twitter:description)["\']',
+        re.I,
+    ),
 ]
+
 DATE_RE = [
-    re.compile(r'<meta[^>]+(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished|pubdate|publishdate)["\'][^>]*?content=["\']([^"\']+)', re.I),
-    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished)["\']', re.I),
+    re.compile(
+        r'<meta[^>]+(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished|pubdate|publishdate)["\'][^>]*?content=["\']([^"\']+)',
+        re.I,
+    ),
+    re.compile(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name|itemprop)=["\'](?:article:published_time|og:published_time|datePublished)["\']',
+        re.I,
+    ),
     re.compile(r'"datePublished"\s*:\s*"([^"]+)"', re.I),
 ]
 
+IMAGE_RE = [
+    re.compile(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]*?content=["\']([^"\']+)',
+        re.I,
+    ),
+    re.compile(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name)=["\'](?:og:image|twitter:image)["\']',
+        re.I,
+    ),
+]
+
+
 def fetch_article_info(gurl):
-    """Best effort: decode the Google News link, then read the article's
-    summary and REAL publish date. Any failure just returns blanks."""
-    info = {"url": "", "summary": "", "pub": ""}
+    """
+    Decode a Google News URL, then extract publisher summary/date/image.
+    Google News stories are only displayed when a real publisher date is found.
+    """
+    info = {"url": "", "summary": "", "pub": "", "image": ""}
+
     try:
         from googlenewsdecoder import gnewsdecoder
+
         res = gnewsdecoder(gurl, interval=1)
         real = res.get("decoded_url") if res.get("status") else ""
+
         if not real:
             return info
+
         info["url"] = real
-        req = urllib.request.Request(real, headers={"User-Agent": "Mozilla/5.0"})
+
+        req = urllib.request.Request(
+            real,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                )
+            },
+        )
+
         with urllib.request.urlopen(req, timeout=8) as r:
-            page = r.read(300000).decode("utf-8", "ignore")
-        for rx in META_RE:
+            page = r.read(450000).decode("utf-8", "ignore")
+
+        for rx in META_DESC_RE:
             m = rx.search(page)
             if m:
                 info["summary"] = html.unescape(m.group(1)).strip()
                 break
+
         for rx in DATE_RE:
             m = rx.search(page)
             d = parse_dt(html.unescape(m.group(1))) if m else None
             if d:
                 info["pub"] = d.isoformat()
                 break
+
+        for rx in IMAGE_RE:
+            m = rx.search(page)
+            if m:
+                info["image"] = html.unescape(m.group(1)).strip()
+                break
+
+        # Last-resort date from publisher URL path.
         if not info["pub"]:
-            m = re.search(r'/(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?:[/-]|$)', real)
+            m = re.search(
+                r"/(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?:[/?#-]|$)", real
+            )
             if m:
                 y, mo, dd = map(int, m.groups())
-                info["pub"] = datetime(y, mo, dd, tzinfo=IST).astimezone(timezone.utc).isoformat()
+                d = datetime(y, mo, dd, tzinfo=IST).astimezone(timezone.utc)
+                info["pub"] = d.isoformat()
+
     except Exception:
         pass
+
     return info
 
+
 def timed(fn, arg, seconds):
-    """Run fn(arg) but give up after `seconds` (a stuck lookup can't hang the run)."""
     box = {}
     t = threading.Thread(target=lambda: box.update(v=fn(arg)), daemon=True)
     t.start()
     t.join(seconds)
-    return box.get("v") or {"url": "", "summary": "", "pub": ""}
+    return box.get("v") or {"url": "", "summary": "", "pub": "", "image": ""}
+
 
 def load_cache():
     try:
         with open(CACHE, encoding="utf-8") as f:
-            c = json.load(f)
-        return c if c.get("_v") == 4 else {}
+            cache = json.load(f)
+        return cache if cache.get("_v") == CACHE_VERSION else {}
     except Exception:
         return {}
 
-# ---- fetch -------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# FETCH
+# ---------------------------------------------------------------------
+
 MIN_DT = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 
 def fetch_all():
     items = []
+
     for source, url in FEEDS.items():
         try:
             feed = feedparser.parse(url)
-        except Exception as e:
-            print(f"[!] Could not fetch {source}: {e}")
+        except Exception as exc:
+            print(f"[!] Could not fetch {source}: {exc}")
             continue
+
         if not feed.entries:
-            print(f"[!] {source} returned no entries — feed may have moved or blocked us.")
+            print(f"[!] {source} returned no entries.")
             continue
-        is_g = "news.google.com" in url
-        for e in feed.entries:
-            title = e.get("title", "").strip()
-            raw = e.get("summary", "")
+
+        is_google = "news.google.com" in url
+
+        for entry in feed.entries:
+            title = entry.get("title", "").strip()
+            if not title:
+                continue
+
+            raw = entry.get("summary", "") or entry.get("description", "")
             label = source
-            if is_g:
+
+            if is_google:
+                # Google News title is usually "Headline - Publisher".
                 if " - " in title:
-                    title, label = title.rsplit(" - ", 1)
-                    label = label.strip()
+                    title, publisher = title.rsplit(" - ", 1)
+                    publisher = publisher.strip()
+                    if publisher:
+                        label = publisher
                 raw = ""
-            tags = tag_story(title, html.unescape(TAG_RE.sub(" ", raw)))
+
+            tags, group = classify_story(title, strip_html(raw))
             if not tags:
                 continue
-            st = e.get("published_parsed") or e.get("updated_parsed")
-            dt = datetime(*st[:6], tzinfo=timezone.utc) if st else None
-            link = e.get("link", "")
-            items.append({"source": label, "title": title, "link": link, "glink": link,
-                          "summary": clean_summary(raw, title), "tags": tags,
-                          "dt": dt, "verified": not is_g, "google": is_g})
-    best = {}
-    for it in sorted(items, key=lambda x: x["dt"] or MIN_DT, reverse=True):
-        k = re.sub(r"[^a-z0-9]", "", it["title"].lower())
-        if k not in best or (it["summary"] and not best[k]["summary"]):
-            best[k] = it
-    out = sorted(best.values(), key=lambda x: x["dt"] or MIN_DT, reverse=True)[:MAX_STORIES + 60]
 
-    # Google News stories: read summary + REAL publish date from the article
-    # (Google's own timestamps are unreliable). Cached, capped per run.
-    cache, fetched, fails, t0 = load_cache(), 0, 0, time.time()
-    for it in out:
-        if not it["google"]:
+            st = entry.get("published_parsed") or entry.get("updated_parsed")
+            dt = datetime(*st[:6], tzinfo=timezone.utc) if st else None
+            link = entry.get("link", "")
+
+            items.append(
+                {
+                    "source": source_short(label),
+                    "title": title,
+                    "link": link,
+                    "glink": link,
+                    "summary": clean_summary(raw, title),
+                    "tags": tags,
+                    "group": group,
+                    "dt": dt,
+                    "verified": not is_google,
+                    "google": is_google,
+                    "image": entry_image(entry),
+                }
+            )
+
+    # De-duplicate by normalized title.
+    best = {}
+    for item in sorted(items, key=lambda x: x["dt"] or MIN_DT, reverse=True):
+        key = re.sub(r"[^a-z0-9]", "", item["title"].lower())
+
+        if key not in best:
+            best[key] = item
+        elif item["summary"] and not best[key]["summary"]:
+            best[key] = item
+
+    out = sorted(
+        best.values(),
+        key=lambda x: x["dt"] or MIN_DT,
+        reverse=True,
+    )[: MAX_STORIES + 100]
+
+    # Enrich + VERIFY Google News stories.
+    cache = load_cache()
+    fetched = 0
+    fails = 0
+    started = time.time()
+
+    for item in out:
+        if not item["google"]:
             continue
-        info = cache.get(it["glink"])
-        in_budget = (fetched < MAX_ENRICH_PER_RUN and fails < MAX_CONSEC_FAILS
-                     and time.time() - t0 < ENRICH_BUDGET_SEC)
-        if (info is None or "pub" not in info) and in_budget:
-            info = cache[it["glink"]] = timed(fetch_article_info, it["glink"], PER_ARTICLE_SEC)
+
+        info = cache.get(item["glink"])
+
+        within_budget = (
+            fetched < MAX_ENRICH_PER_RUN
+            and fails < MAX_CONSEC_FAILS
+            and time.time() - started < ENRICH_BUDGET_SEC
+        )
+
+        if (info is None or "pub" not in info) and within_budget:
+            info = timed(fetch_article_info, item["glink"], PER_ARTICLE_SEC)
+            cache[item["glink"]] = info
             fetched += 1
             fails = 0 if info.get("url") else fails + 1
-            if not info.get("pub") and fetched <= 40:
-                print(f"[date?] no date: {it['source']} | {it['title'][:45]} | "
-                      f"{info.get('url') or 'link decode failed'}")
+
         if info:
-            it["summary"] = clean_summary(info.get("summary", ""), it["title"])
             if info.get("url"):
-                it["link"] = info["url"]
+                item["link"] = info["url"]
+
+            if info.get("summary"):
+                item["summary"] = clean_summary(info["summary"], item["title"])
+
+            if info.get("image"):
+                item["image"] = info["image"]
+
             pub = parse_dt(info.get("pub", ""))
             if pub:
-                it["dt"], it["verified"] = pub, True
+                item["dt"] = pub
+                item["verified"] = True
+
+    # Save only current Google items.
     try:
         keep = {i["glink"] for i in out if i["google"]}
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump({"_v": 4, **{k: v for k, v in cache.items() if k in keep}}, f)
+            json.dump(
+                {
+                    "_v": CACHE_VERSION,
+                    **{k: v for k, v in cache.items() if k in keep},
+                },
+                f,
+            )
     except Exception:
         pass
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
 
-    # IMPORTANT:
-    # Google News may resurface old articles with a fresh Google timestamp.
-    # If we could not verify the publisher's real publish date, DO NOT show
-    # that Google item as fresh news. This prevents July articles appearing
-    # as "12 hr ago" in September.
+    # Critical freshness rule:
+    # Direct publisher RSS is trusted.
+    # Google News-discovered articles are kept ONLY if publisher date was verified.
     out = [
-        i for i in out
-        if (not i["google"] or i["verified"])
-        and i["dt"] is not None
+        i
+        for i in out
+        if i["dt"] is not None
         and i["dt"] >= cutoff
+        and (not i["google"] or i["verified"])
     ]
 
     out = sorted(out, key=lambda x: x["dt"], reverse=True)[:MAX_STORIES]
-    g = [i for i in out if i["google"]]
-    print(f"Google News stories kept with verified dates: {len(g)}")
 
-    for i in out:
-        i["ago"] = time_ago(i["dt"])
-        i["published"] = i["dt"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+    for item in out:
+        item["ago"] = time_ago(item["dt"])
+        item["published"] = item["dt"].astimezone(IST).strftime(
+            "%d %b %Y, %I:%M %p IST"
+        )
+        item["domain"] = source_domain(item["link"])
+
+    print(
+        f"Kept {len(out)} stories; "
+        f"verified Google stories: {sum(1 for i in out if i['google'])}"
+    )
 
     return out
 
-# ---- page --------------------------------------------------------------
-CSS = """
+
+# ---------------------------------------------------------------------
+# PAGE
+# ---------------------------------------------------------------------
+
+CSS = r"""
+:root{
+  --nav:#272727;
+  --nav2:#353535;
+  --ink:#171b22;
+  --muted:#747b86;
+  --line:#dde1e7;
+  --paper:#ffffff;
+  --bg:#f3f4f6;
+  --blue:#153d73;
+  --green:#188038;
+  --red:#c62828;
+  --gold:#9b7410;
+}
 *{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,'Segoe UI',Arial,sans-serif;background:#f1f3f6;color:#1b1f2a}
-header{background:linear-gradient(135deg,#0f1b3d,#1d3468);color:#fff;padding:22px 24px 16px}
-header h1{margin:0;font-size:22px;letter-spacing:.2px}
-header .meta{margin-top:4px;font-size:12px;color:#b9c4e2}
-.bar{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid #e3e6ec;padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
-.f{border:1px solid #d5d9e2;background:#fff;border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer;color:#33394a}
-.f.on{background:#0f1b3d;border-color:#0f1b3d;color:#fff}
-.wrap{max-width:900px;margin:18px auto;padding:0 14px;display:flex;flex-direction:column;gap:10px}
-.card{display:flex;gap:16px;justify-content:space-between;background:#fff;border-radius:10px;border-left:5px solid var(--c,#8a93a6);padding:14px 16px;box-shadow:0 1px 3px rgba(20,30,60,.08)}
-.main{min-width:0;flex:1}
-.title{display:block;font-size:16px;font-weight:650;line-height:1.35;color:#0f1b3d;text-decoration:none}
-.title:hover{text-decoration:underline}
-.summary{margin:6px 0 0;font-size:13.5px;line-height:1.55;color:#4a5163}
-.src{margin-top:8px;font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#7a8296}
-.side{flex:0 0 118px;display:flex;flex-direction:column;align-items:flex-end;gap:8px;text-align:right}
-.chip{display:inline-block;font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:5px;background:var(--bg,#eceef3);color:var(--c,#4a5163)}
-.ago{font-size:12px;color:#8a92a5;white-space:nowrap}
-.t-gold{--c:#8a6500;--bg:#fff2c2}.t-silver{--c:#4a5563;--bg:#e9edf2}.t-crude-oil{--c:#6b3f1d;--bg:#f1e3d3}
-.t-natural-gas{--c:#0b5c8a;--bg:#dcf1fd}.t-copper{--c:#a4461a;--bg:#fde2d2}.t-base-metals{--c:#3a4a8a;--bg:#e3e7f8}
-.t-agri{--c:#2b6b2a;--bg:#e0f3de}.t-commodities{--c:#444a5a;--bg:#eceef3}
-.empty{text-align:center;color:#8a92a5;padding:30px}
-@media(max-width:560px){.card{flex-direction:column;gap:8px}.side{flex-direction:row;align-items:center;justify-content:space-between;flex-basis:auto;text-align:left}}
+html{scroll-behavior:smooth}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--ink);
+  font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+}
+.top{
+  background:var(--nav);
+  color:#fff;
+  border-bottom:1px solid #454545;
+}
+.top-inner{
+  max-width:1380px;
+  margin:auto;
+  min-height:64px;
+  padding:0 22px;
+  display:flex;
+  align-items:center;
+  gap:28px;
+}
+.brand{
+  font-size:21px;
+  font-weight:800;
+  line-height:1;
+  letter-spacing:-.3px;
+  white-space:nowrap;
+}
+.brand small{
+  display:block;
+  margin-top:5px;
+  font-size:10px;
+  font-weight:600;
+  letter-spacing:1.5px;
+  color:#bfc4ca;
+}
+.nav{
+  display:flex;
+  align-items:center;
+  gap:25px;
+  margin-left:auto;
+}
+.nav a{
+  color:#fff;
+  text-decoration:none;
+  font-size:14px;
+}
+.nav a:hover{color:#d8e7ff}
+.search-shell{
+  width:245px;
+  border-bottom:1px solid #777;
+}
+.search-shell input{
+  width:100%;
+  padding:10px 2px;
+  background:transparent;
+  color:#fff;
+  border:0;
+  outline:none;
+}
+.search-shell input::placeholder{color:#aaa}
+.status{
+  background:#fff;
+  border-bottom:1px solid var(--line);
+}
+.status-inner{
+  max-width:1380px;
+  margin:auto;
+  padding:10px 22px;
+  display:flex;
+  justify-content:space-between;
+  gap:15px;
+  color:#677080;
+  font-size:12px;
+}
+.filterbar{
+  position:sticky;
+  top:0;
+  z-index:10;
+  background:rgba(255,255,255,.97);
+  border-bottom:1px solid var(--line);
+  backdrop-filter:blur(10px);
+}
+.filters{
+  max-width:1380px;
+  margin:auto;
+  padding:9px 22px;
+  display:flex;
+  gap:7px;
+  overflow-x:auto;
+  scrollbar-width:none;
+}
+.filters::-webkit-scrollbar{display:none}
+.filter{
+  border:1px solid #d9dde4;
+  background:#fff;
+  border-radius:4px;
+  padding:7px 11px;
+  white-space:nowrap;
+  font-size:12px;
+  color:#424956;
+  cursor:pointer;
+}
+.filter:hover,.filter.on{
+  background:#1f2e43;
+  border-color:#1f2e43;
+  color:#fff;
+}
+.page{
+  max-width:1380px;
+  margin:0 auto;
+  padding:30px 22px 55px;
+}
+.hero-grid{
+  display:grid;
+  grid-template-columns:minmax(0,2fr) minmax(320px,.92fr);
+  gap:20px;
+  align-items:stretch;
+}
+.hero{
+  min-height:390px;
+  position:relative;
+  overflow:hidden;
+  background:linear-gradient(135deg,#1f334b,#0e1722);
+  color:#fff;
+  border:1px solid #d6dae0;
+}
+.hero-media{
+  position:absolute;
+  inset:0;
+}
+.hero-media img{
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  display:block;
+}
+.hero-shade{
+  position:absolute;
+  inset:0;
+  background:linear-gradient(90deg,rgba(8,14,22,.90) 0%,rgba(8,14,22,.64) 50%,rgba(8,14,22,.18) 100%);
+}
+.hero-content{
+  position:relative;
+  z-index:2;
+  width:min(690px,78%);
+  min-height:390px;
+  padding:45px 34px 30px;
+  display:flex;
+  flex-direction:column;
+  justify-content:flex-end;
+}
+.kicker{
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:1.1px;
+  color:#dce9ff;
+  margin-bottom:12px;
+}
+.hero h1{
+  margin:0;
+  font-size:35px;
+  line-height:1.12;
+  letter-spacing:-.65px;
+}
+.hero p{
+  margin:16px 0 0;
+  max-width:650px;
+  font-size:15px;
+  line-height:1.6;
+  color:#eef2f6;
+}
+.meta{
+  margin-top:18px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:9px 14px;
+  font-size:11.5px;
+  color:#d7dce3;
+}
+.hero a.cover-link{
+  position:absolute;
+  inset:0;
+  z-index:4;
+}
+.sidebox{
+  background:#fff;
+  border:1px solid var(--line);
+  padding:18px 18px 13px;
+}
+.sidebox h2{
+  margin:0 0 8px;
+  font-size:17px;
+}
+.side-tabs{
+  display:flex;
+  gap:16px;
+  border-bottom:1px solid var(--line);
+  margin-bottom:5px;
+  overflow:auto;
+}
+.side-tab{
+  padding:7px 0 9px;
+  font-size:12px;
+  white-space:nowrap;
+  color:#5f6672;
+  border-bottom:2px solid transparent;
+}
+.side-tab.on{
+  color:#111;
+  border-bottom-color:#111;
+}
+.side-story{
+  display:block;
+  padding:12px 0;
+  border-bottom:1px solid #e9ebef;
+  text-decoration:none;
+  color:inherit;
+}
+.side-story:last-child{border-bottom:0}
+.side-story strong{
+  display:block;
+  font-size:13.5px;
+  line-height:1.4;
+}
+.side-story span{
+  display:block;
+  margin-top:5px;
+  font-size:11px;
+  color:#89909a;
+}
+.section-head{
+  display:flex;
+  justify-content:space-between;
+  align-items:end;
+  gap:15px;
+  margin:30px 0 12px;
+}
+.section-head h2{
+  margin:0;
+  font-size:21px;
+}
+.section-head .small{
+  color:#808793;
+  font-size:12px;
+}
+.news-grid{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:18px;
+}
+.card{
+  background:#fff;
+  border:1px solid var(--line);
+  min-height:245px;
+  padding:20px 20px 17px;
+  display:flex;
+  flex-direction:column;
+  transition:transform .15s ease,box-shadow .15s ease;
+}
+.card:hover{
+  transform:translateY(-2px);
+  box-shadow:0 7px 22px rgba(20,28,40,.08);
+}
+.chips{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+  margin-bottom:12px;
+}
+.chip{
+  display:inline-block;
+  border-radius:3px;
+  background:#eef2f7;
+  color:#39485c;
+  padding:4px 7px;
+  font-size:10px;
+  font-weight:700;
+}
+.chip.agri{background:#e8f5e9;color:#23622d}
+.chip.energy{background:#fff1e5;color:#7a4418}
+.chip.metals{background:#e9eefb;color:#304c88}
+.card h3{
+  margin:0;
+  font-size:18px;
+  line-height:1.35;
+  letter-spacing:-.15px;
+}
+.card h3 a{
+  color:#171b22;
+  text-decoration:none;
+}
+.card h3 a:hover{text-decoration:underline}
+.card p{
+  margin:10px 0 0;
+  color:#565e69;
+  font-size:13.5px;
+  line-height:1.55;
+  display:-webkit-box;
+  -webkit-line-clamp:4;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+.card-foot{
+  margin-top:auto;
+  padding-top:16px;
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:end;
+}
+.source{
+  font-size:11px;
+  font-weight:800;
+  text-transform:uppercase;
+  letter-spacing:.55px;
+  color:#636b77;
+}
+.time{
+  text-align:right;
+  font-size:10.5px;
+  line-height:1.45;
+  color:#8b929d;
+}
+.empty{
+  grid-column:1/-1;
+  padding:50px;
+  background:#fff;
+  border:1px solid var(--line);
+  text-align:center;
+  color:#7b828d;
+}
+footer{
+  border-top:1px solid var(--line);
+  background:#fff;
+  color:#707783;
+  font-size:11px;
+}
+.footer-inner{
+  max-width:1380px;
+  margin:auto;
+  padding:20px 22px;
+}
+@media(max-width:980px){
+  .nav{display:none}
+  .search-shell{margin-left:auto}
+  .hero-grid{grid-template-columns:1fr}
+  .news-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:640px){
+  .top-inner{padding:0 14px}
+  .brand{font-size:18px}
+  .search-shell{width:145px}
+  .status-inner{padding:9px 14px;display:block}
+  .status-inner span{display:block;margin-top:3px}
+  .filters{padding:8px 14px}
+  .page{padding:18px 14px 40px}
+  .hero{min-height:350px}
+  .hero-content{
+    min-height:350px;
+    width:100%;
+    padding:28px 22px;
+  }
+  .hero h1{font-size:28px}
+  .hero-shade{
+    background:linear-gradient(0deg,rgba(8,14,22,.94),rgba(8,14,22,.30));
+  }
+  .news-grid{grid-template-columns:1fr}
+}
 """
-JS = """
-const fs=[...document.querySelectorAll('.f')],cs=[...document.querySelectorAll('.card')];
-fs.forEach(b=>b.onclick=()=>{fs.forEach(x=>x.classList.remove('on'));b.classList.add('on');
-const t=b.dataset.tag;cs.forEach(c=>{c.style.display=(t==='All'||c.dataset.tags.split('|').includes(t))?'':'none'})});
+
+
+JS = r"""
+const cards=[...document.querySelectorAll('.card')];
+const buttons=[...document.querySelectorAll('.filter')];
+const search=document.getElementById('search');
+
+let active='All';
+
+function applyFilters(){
+  const q=(search.value||'').trim().toLowerCase();
+
+  cards.forEach(card=>{
+    const tags=(card.dataset.tags||'').split('|');
+    const group=card.dataset.group||'';
+    const blob=(card.dataset.search||'').toLowerCase();
+
+    const categoryOK =
+      active==='All' ||
+      group===active ||
+      tags.includes(active);
+
+    const searchOK=!q || blob.includes(q);
+
+    card.style.display=(categoryOK && searchOK)?'':'none';
+  });
+
+  const visible=cards.filter(c=>c.style.display!=='none').length;
+  document.getElementById('visibleCount').textContent=visible;
+}
+
+buttons.forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    buttons.forEach(x=>x.classList.remove('on'));
+    btn.classList.add('on');
+    active=btn.dataset.tag;
+    applyFilters();
+  });
+});
+
+search.addEventListener('input',applyFilters);
 """
-slug = lambda t: t.lower().replace(" ", "-")
-esc = html.escape
+
+
+def esc(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+def chip_class(group):
+    return group.lower() if group in {"Agri", "Energy", "Metals"} else ""
+
+
+def render_side_story(item):
+    return (
+        f'<a class="side-story" href="{esc(item["link"])}" target="_blank" rel="noopener">'
+        f'<strong>{esc(item["title"])}</strong>'
+        f'<span>{esc(item["source"])} · {esc(item["ago"])}</span>'
+        f"</a>"
+    )
+
+
+def render_card(item):
+    chips = (
+        f'<span class="chip {chip_class(item["group"])}">{esc(item["group"])}</span>'
+        + "".join(f'<span class="chip">{esc(t)}</span>' for t in item["tags"])
+    )
+
+    summary = (
+        f'<p>{esc(item["summary"])}</p>'
+        if item["summary"]
+        else "<p>Open the publisher link to read the full report.</p>"
+    )
+
+    search_blob = " ".join(
+        [
+            item["title"],
+            item["summary"],
+            item["source"],
+            item["group"],
+            *item["tags"],
+        ]
+    )
+
+    return (
+        f'<article class="card" '
+        f'data-group="{esc(item["group"])}" '
+        f'data-tags="{esc("|".join(item["tags"]))}" '
+        f'data-search="{esc(search_blob)}">'
+        f'<div class="chips">{chips}</div>'
+        f'<h3><a href="{esc(item["link"])}" target="_blank" rel="noopener">'
+        f'{esc(item["title"])}</a></h3>'
+        f"{summary}"
+        f'<div class="card-foot">'
+        f'<div class="source">{esc(item["source"])}</div>'
+        f'<div class="time"><b>{esc(item["ago"])}</b><br>{esc(item["published"])}</div>'
+        f"</div></article>"
+    )
+
 
 def write_html(items):
-    counts = {}
-    for it in items:
-        for t in it["tags"]:
-            counts[t] = counts.get(t, 0) + 1
-    btns = f'<button class="f on" data-tag="All">All ({len(items)})</button>' + "".join(
-        f'<button class="f" data-tag="{esc(t)}">{esc(t)} ({n})</button>'
-        for t, n in sorted(counts.items(), key=lambda kv: -kv[1]))
-    cards = []
-    for it in items:
-        chips = "".join(f'<span class="chip t-{slug(t)}">{esc(t)}</span>' for t in it["tags"])
-        summ = f'<p class="summary">{esc(it["summary"])}</p>' if it["summary"] else ""
-        cards.append(
-            f'<article class="card t-{slug(it["tags"][0])}" data-tags="{esc("|".join(it["tags"]))}">'
-            f'<div class="main"><a class="title" href="{esc(it["link"])}" target="_blank" rel="noopener">{esc(it["title"])}</a>'
-            f'{summ}<div class="src">{esc(it["source"])}</div></div>'
-            f'<div class="side"><div>{chips}</div><div class="ago">{esc(it["ago"])}<br><span title="Publisher publish time">{esc(it["published"])}</span></div></div></article>')
-    now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
-    page = (f'<!DOCTYPE html><html><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<meta http-equiv="refresh" content="1800"><title>Commodities News</title>'
-            f'<style>{CSS}</style></head><body><header><h1>Commodities News</h1>'
-            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · Google News items shown only when publisher date is verified</div></header>'
-            f'<div class="bar">{btns}</div><div class="wrap">{"".join(cards) or "<div class=empty>No stories right now.</div>"}</div>'
-            f'<script>{JS}</script></body></html>')
+    now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+
+    if items:
+        hero = items[0]
+        hero_img = (
+            f'<div class="hero-media"><img src="{esc(hero["image"])}" '
+            f'alt="" loading="eager" referrerpolicy="no-referrer"></div>'
+            if hero["image"]
+            else ""
+        )
+        hero_summary = hero["summary"] or "Open the publisher link for the full report."
+
+        hero_html = (
+            '<section class="hero">'
+            f"{hero_img}"
+            '<div class="hero-shade"></div>'
+            '<div class="hero-content">'
+            f'<div class="kicker">{esc(hero["group"])} · {esc(hero["source"])}</div>'
+            f"<h1>{esc(hero['title'])}</h1>"
+            f"<p>{esc(hero_summary)}</p>"
+            '<div class="meta">'
+            f"<span>{esc(hero['ago'])}</span>"
+            f"<span>{esc(hero['published'])}</span>"
+            f"<span>{esc(' / '.join(hero['tags']))}</span>"
+            "</div></div>"
+            f'<a class="cover-link" href="{esc(hero["link"])}" '
+            'target="_blank" rel="noopener" aria-label="Open featured story"></a>'
+            "</section>"
+        )
+    else:
+        hero_html = (
+            '<section class="hero"><div class="hero-content">'
+            "<h1>No fresh stories available</h1>"
+            "<p>The next scheduled refresh will try the configured sources again.</p>"
+            "</div></section>"
+        )
+
+    side_items = items[1:7]
+    side_html = "".join(render_side_story(x) for x in side_items)
+    if not side_html:
+        side_html = '<div style="padding:30px 0;color:#888">No additional stories.</div>'
+
+    # Buttons are generated from groups + most useful commodity tags.
+    groups = ["All", "Agri", "Metals", "Energy", "Commodities"]
+    preferred_tags = [
+        "Gold", "Silver", "Crude Oil", "Natural Gas", "Copper", "Aluminium",
+        "Zinc", "Cotton", "Guar", "Turmeric", "Jeera", "Sugar", "Wheat",
+        "Soybean", "Corn", "Rice", "Mustard", "Palm Oil", "Coffee", "Cocoa",
+    ]
+
+    present_groups = {i["group"] for i in items}
+    present_tags = {t for i in items for t in i["tags"]}
+
+    filters = ["All"]
+    filters += [g for g in groups[1:] if g in present_groups]
+    filters += [t for t in preferred_tags if t in present_tags]
+
+    buttons = "".join(
+        f'<button class="filter {"on" if name == "All" else ""}" '
+        f'data-tag="{esc(name)}">{esc(name)}</button>'
+        for name in filters
+    )
+
+    cards = "".join(render_card(i) for i in items[1:])
+    if not cards:
+        cards = '<div class="empty">No fresh commodity stories right now.</div>'
+
+    reuters_count = sum(1 for i in items if "reuters" in i["source"].lower())
+
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="1800">
+<title>Commodities News Dashboard</title>
+<style>{CSS}</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand">
+      COMMODITIES NEWS
+      <small>MARKETS · METALS · ENERGY · AGRI</small>
+    </div>
+
+    <nav class="nav">
+      <a href="#latest">Latest</a>
+      <a href="#" data-nav="Agri">Agri</a>
+      <a href="#" data-nav="Metals">Metals</a>
+      <a href="#" data-nav="Energy">Energy</a>
+    </nav>
+
+    <div class="search-shell">
+      <input id="search" type="search" placeholder="Search news, source, commodity…">
+    </div>
+  </div>
+</header>
+
+<div class="status">
+  <div class="status-inner">
+    <div><b>Updated:</b> {esc(now)}</div>
+    <span>
+      {len(items)} fresh stories · Reuters {reuters_count} ·
+      publisher dates verified for Google-discovered stories
+    </span>
+  </div>
+</div>
+
+<div class="filterbar">
+  <div class="filters">{buttons}</div>
+</div>
+
+<main class="page">
+  <div class="hero-grid">
+    {hero_html}
+
+    <aside class="sidebox">
+      <h2>Latest Headlines</h2>
+      <div class="side-tabs">
+        <span class="side-tab on">Latest</span>
+        <span class="side-tab">Commodities</span>
+        <span class="side-tab">India + Global</span>
+      </div>
+      {side_html}
+    </aside>
+  </div>
+
+  <div class="section-head" id="latest">
+    <h2>Latest Commodity News</h2>
+    <div class="small">
+      Showing <span id="visibleCount">{max(0, len(items)-1)}</span> stories
+    </div>
+  </div>
+
+  <section class="news-grid">
+    {cards}
+  </section>
+</main>
+
+<footer>
+  <div class="footer-inner">
+    Headlines, summaries and timestamps belong to their respective publishers.
+    This page links users to the original source. Google News is used only for
+    discovery where configured; publisher dates are verified before those stories
+    are displayed.
+  </div>
+</footer>
+
+<script>{JS}</script>
+<script>
+document.querySelectorAll('[data-nav]').forEach(a=>{{
+  a.addEventListener('click',e=>{{
+    e.preventDefault();
+    const name=a.dataset.nav;
+    const b=[...document.querySelectorAll('.filter')].find(x=>x.dataset.tag===name);
+    if(b) b.click();
+    document.getElementById('latest').scrollIntoView({{behavior:'smooth'}});
+  }});
+}});
+</script>
+</body>
+</html>"""
+
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(page)
-    with_sum = sum(1 for i in items if i["summary"])
-    print(f"Wrote {len(items)} stories to {OUT} ({with_sum} with summaries)")
+
+    print(f"Wrote {len(items)} stories to {OUT}")
+
 
 if __name__ == "__main__":
     write_html(fetch_all())
