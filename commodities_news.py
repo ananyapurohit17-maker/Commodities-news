@@ -18,7 +18,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 OUT = "docs/index.html"
 CACHE = "docs/summary_cache.json"
 SUMMARY_MAX = 420          # ~3 sentences
-MAX_ENRICH_PER_RUN = 30    # article pages fetched per run (Google News items)
+MAX_ENRICH_PER_RUN = 80    # try to verify more Google News article dates per run
 MAX_STORIES = 150
 ENRICH_BUDGET_SEC = 150     # hard stop for all article lookups per run
 PER_ARTICLE_SEC = 15       # give up on any single article after this
@@ -186,7 +186,7 @@ def load_cache():
     try:
         with open(CACHE, encoding="utf-8") as f:
             c = json.load(f)
-        return c if c.get("_v") == 3 else {}
+        return c if c.get("_v") == 4 else {}
     except Exception:
         return {}
 
@@ -257,17 +257,32 @@ def fetch_all():
         keep = {i["glink"] for i in out if i["google"]}
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         with open(CACHE, "w", encoding="utf-8") as f:
-            json.dump({"_v": 3, **{k: v for k, v in cache.items() if k in keep}}, f)
+            json.dump({"_v": 4, **{k: v for k, v in cache.items() if k in keep}}, f)
     except Exception:
         pass
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
-    out = [i for i in out if i["dt"] is None or i["dt"] >= cutoff]
-    out = sorted(out, key=lambda x: x["dt"] or MIN_DT, reverse=True)[:MAX_STORIES]
+
+    # IMPORTANT:
+    # Google News may resurface old articles with a fresh Google timestamp.
+    # If we could not verify the publisher's real publish date, DO NOT show
+    # that Google item as fresh news. This prevents July articles appearing
+    # as "12 hr ago" in September.
+    out = [
+        i for i in out
+        if (not i["google"] or i["verified"])
+        and i["dt"] is not None
+        and i["dt"] >= cutoff
+    ]
+
+    out = sorted(out, key=lambda x: x["dt"], reverse=True)[:MAX_STORIES]
     g = [i for i in out if i["google"]]
-    print(f"Google News stories with verified dates: {sum(i['verified'] for i in g)}/{len(g)}")
+    print(f"Google News stories kept with verified dates: {len(g)}")
+
     for i in out:
-        i["ago"] = time_ago(i["dt"]) if i["verified"] else "~" + time_ago(i["dt"])
+        i["ago"] = time_ago(i["dt"])
+        i["published"] = i["dt"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+
     return out
 
 # ---- page --------------------------------------------------------------
@@ -320,13 +335,13 @@ def write_html(items):
             f'<article class="card t-{slug(it["tags"][0])}" data-tags="{esc("|".join(it["tags"]))}">'
             f'<div class="main"><a class="title" href="{esc(it["link"])}" target="_blank" rel="noopener">{esc(it["title"])}</a>'
             f'{summ}<div class="src">{esc(it["source"])}</div></div>'
-            f'<div class="side"><div>{chips}</div><div class="ago">{esc(it["ago"])}</div></div></article>')
+            f'<div class="side"><div>{chips}</div><div class="ago">{esc(it["ago"])}<br><span title="Publisher publish time">{esc(it["published"])}</span></div></div></article>')
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
     page = (f'<!DOCTYPE html><html><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta http-equiv="refresh" content="1800"><title>Commodities News</title>'
             f'<style>{CSS}</style></head><body><header><h1>Commodities News</h1>'
-            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · “~” = approximate time (from Google News)</div></header>'
+            f'<div class="meta">Updated {now} IST · {len(items)} stories · refreshes every 30 min · Google News items shown only when publisher date is verified</div></header>'
             f'<div class="bar">{btns}</div><div class="wrap">{"".join(cards) or "<div class=empty>No stories right now.</div>"}</div>'
             f'<script>{JS}</script></body></html>')
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
