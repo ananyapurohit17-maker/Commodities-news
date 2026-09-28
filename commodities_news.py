@@ -36,12 +36,36 @@ MAX_STORIES = 180
 MAX_AGE_DAYS = 5
 
 # Google News items must be publisher-verified before display.
-MAX_ENRICH_PER_RUN = 100
-ENRICH_BUDGET_SEC = 220
+MAX_ENRICH_PER_RUN = 180
+ENRICH_BUDGET_SEC = 300
 PER_ARTICLE_SEC = 12
 MAX_CONSEC_FAILS = 10
 
-CACHE_VERSION = 5
+
+CACHE_VERSION = 6
+
+# These sources are important for commodity research and get verified first,
+# so mainstream feeds cannot consume the entire Google-News verification budget.
+PRIORITY_SOURCES = {
+    "AL Circle",
+    "ALCircle",
+    "International Aluminium Institute",
+    "SMM",
+    "Shanghai Metals Market",
+    "Metal.com",
+    "Fibre2Fashion",
+    "Agriwatch",
+    "IEA",
+    "International Energy Agency",
+    "Forex Factory",
+    "ChiniMandi",
+    "USDA",
+    "U.S. Department of Agriculture",
+    "Reuters",
+}
+
+# Reserve a reasonable number of candidate stories per specialist publisher.
+PRIORITY_PER_SOURCE = 12
 
 
 # ---------------------------------------------------------------------
@@ -560,15 +584,47 @@ def fetch_all():
     )[: MAX_STORIES + 100]
 
     # Enrich + VERIFY Google News stories.
+    # IMPORTANT: specialist commodity publishers are verified FIRST, with
+    # per-source fairness, so Reuters/ET/BusinessLine cannot consume the full
+    # enrichment budget before AL Circle, SMM, Fibre2Fashion, ChiniMandi, etc.
     cache = load_cache()
     fetched = 0
     fails = 0
     started = time.time()
 
-    for item in out:
-        if not item["google"]:
-            continue
+    google_items = [i for i in out if i["google"]]
 
+    def is_priority(item):
+        s = item["source"].lower()
+        keys = (
+            "al circle", "alcircle", "international aluminium",
+            "smm", "metal.com", "shanghai metals",
+            "fibre2fashion", "agriwatch", "iea",
+            "international energy agency", "forex factory",
+            "chinimandi", "usda", "u.s. department of agriculture",
+            "reuters",
+        )
+        return any(k in s for k in keys)
+
+    priority = [i for i in google_items if is_priority(i)]
+    normal = [i for i in google_items if not is_priority(i)]
+
+    # Round-robin specialist sources so one prolific site (e.g. SMM) does not
+    # crowd out the others.
+    buckets = {}
+    for item in priority:
+        buckets.setdefault(item["source"], []).append(item)
+
+    priority_order = []
+    for n in range(PRIORITY_PER_SOURCE):
+        for source_name in sorted(buckets):
+            bucket = buckets[source_name]
+            if n < len(bucket):
+                priority_order.append(bucket[n])
+
+    enrichment_order = priority_order + normal
+
+    for item in enrichment_order:
         info = cache.get(item["glink"])
 
         within_budget = (
@@ -577,6 +633,7 @@ def fetch_all():
             and time.time() - started < ENRICH_BUDGET_SEC
         )
 
+        # Cached entries are always reusable. New network lookups obey budget.
         if (info is None or "pub" not in info) and within_budget:
             info = timed(fetch_article_info, item["glink"], PER_ARTICLE_SEC)
             cache[item["glink"]] = info
@@ -639,6 +696,14 @@ def fetch_all():
         f"Kept {len(out)} stories; "
         f"verified Google stories: {sum(1 for i in out if i['google'])}"
     )
+
+    # Helpful GitHub Actions diagnostics: show exactly which publishers made it.
+    source_counts = {}
+    for item in out:
+        source_counts[item["source"]] = source_counts.get(item["source"], 0) + 1
+    print("Sources kept:")
+    for source_name, count in sorted(source_counts.items(), key=lambda kv: (-kv[1], kv[0].lower())):
+        print(f"  {source_name}: {count}")
 
     return out
 
@@ -1039,15 +1104,18 @@ JS = r"""
 const cards=[...document.querySelectorAll('.card')];
 const buttons=[...document.querySelectorAll('.filter')];
 const search=document.getElementById('search');
+const sourceFilter=document.getElementById('sourceFilter');
 
 let active='All';
 
 function applyFilters(){
   const q=(search.value||'').trim().toLowerCase();
+  const selectedSource=(sourceFilter?.value||'All');
 
   cards.forEach(card=>{
     const tags=(card.dataset.tags||'').split('|');
     const group=card.dataset.group||'';
+    const source=card.dataset.source||'';
     const blob=(card.dataset.search||'').toLowerCase();
 
     const categoryOK =
@@ -1055,9 +1123,10 @@ function applyFilters(){
       group===active ||
       tags.includes(active);
 
+    const sourceOK = selectedSource==='All' || source===selectedSource;
     const searchOK=!q || blob.includes(q);
 
-    card.style.display=(categoryOK && searchOK)?'':'none';
+    card.style.display=(categoryOK && sourceOK && searchOK)?'':'none';
   });
 
   const visible=cards.filter(c=>c.style.display!=='none').length;
@@ -1074,6 +1143,7 @@ buttons.forEach(btn=>{
 });
 
 search.addEventListener('input',applyFilters);
+if(sourceFilter) sourceFilter.addEventListener('change',applyFilters);
 """
 
 
@@ -1118,7 +1188,7 @@ def render_card(item):
 
     return (
         f'<article class="card" '
-        f'data-group="{esc(item["group"])}" '
+        f'data-group="{esc(item["group"])}" data-source="{esc(item["source"])}" '
         f'data-tags="{esc("|".join(item["tags"]))}" '
         f'data-search="{esc(search_blob)}">'
         f'<div class="chips">{chips}</div>'
@@ -1202,6 +1272,11 @@ def write_html(items):
 
     reuters_count = sum(1 for i in items if "reuters" in i["source"].lower())
 
+    source_names = sorted({i["source"] for i in items}, key=str.lower)
+    source_options = '<option value="All">All Sources</option>' + "".join(
+        f'<option value="{esc(s)}">{esc(s)}</option>' for s in source_names
+    )
+
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1265,6 +1340,9 @@ def write_html(items):
   <div class="section-head" id="latest">
     <h2>Latest Commodity News</h2>
     <div class="small">
+      <select id="sourceFilter" style="margin-right:10px;padding:6px 8px;border:1px solid #d9dde4;background:#fff">
+        {source_options}
+      </select>
       Showing <span id="visibleCount">{max(0, len(items)-1)}</span> stories
     </div>
   </div>
