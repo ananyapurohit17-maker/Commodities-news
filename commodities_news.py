@@ -165,6 +165,34 @@ FEEDS = {
         gnews('(sugar OR ethanol OR cane OR sugarcane OR molasses OR sugar production OR sugar exports) site:chinimandi.com when:3d'),
     "USDA":
         gnews('(cotton OR wheat OR corn OR maize OR soybeans OR rice OR sugar OR crop OR production OR exports OR stocks OR acreage OR yield) site:usda.gov when:7d'),
+
+    # --- Extra agri publications ---
+    "Agri News - India A":
+        gnews('(wheat OR sugar OR cotton OR soybean OR corn OR maize OR rice OR palm oil OR guar OR turmeric OR jeera OR mustard OR crop OR harvest OR export OR import OR sowing OR acreage OR mandi OR prices) (site:blog.agribazaar.com OR site:newindianexpress.com OR site:agriexchange.apeda.gov.in OR site:krishijagran.com) when:3d'),
+    "Agri News - India B":
+        gnews('(wheat OR sugar OR cotton OR soybean OR corn OR maize OR rice OR palm oil OR guar OR turmeric OR jeera OR mustard OR crop OR harvest OR export OR import OR sowing OR acreage OR mandi OR prices) (site:admis.com OR site:commodity-board.com OR site:igrain.in OR site:agriinsite.com) when:5d'),
+    "Agri News - Global":
+        gnews('(wheat OR sugar OR cotton OR soybean OR corn OR maize OR rice OR palm oil OR guar OR turmeric OR jeera OR mustard OR crop OR harvest OR export OR import OR sowing OR acreage OR mandi OR prices) (site:world-grain.com OR site:agweb.com OR site:ukragroconsult.com OR site:millermagazine.com OR site:ahdb.org.uk OR site:croplife.com OR site:fastmarkets.com) when:5d'),
+    "Agri - International Bodies":
+        gnews('(wheat OR sugar OR cotton OR soybean OR corn OR maize OR rice OR palm oil OR guar OR turmeric OR jeera OR mustard OR crop OR harvest OR export OR import OR sowing OR acreage OR mandi OR prices) (site:fao.org OR site:igc.int OR site:fas.usda.gov OR site:theice.com OR site:safex.co.za) when:7d'),
+
+    # --- Extra bullion / precious metals publications ---
+    "Bullion News A":
+        gnews('(gold OR silver OR bullion OR precious metal) (site:gold.org OR site:capital.com OR site:ssga.com OR site:cmegroup.com OR site:macrotrends.net OR site:goldprice.org OR site:commodityweather.com) when:3d'),
+    "Bullion News B":
+        gnews('(gold OR silver OR bullion OR precious metal) (site:bloomberg.com OR site:cnbc.com OR site:marketwatch.com OR site:wsj.com OR site:ft.com OR site:thestreet.com OR site:forbes.com OR site:zacks.com) when:3d'),
+    "Bullion News C":
+        gnews('(gold OR silver OR bullion OR precious metal) (site:silverinstitute.org OR site:goldsilver.com OR site:bullionvault.com OR site:silverdoctors.com OR site:metalsdaily.com OR site:apmex.com OR site:jmbullion.com OR site:investingnews.com OR site:mining.com OR site:sprott.com OR site:wisdomtree.com OR site:etftrends.com) when:3d'),
+
+    # --- Extra base metals publications ---
+    "Base Metals News":
+        gnews('(copper OR aluminium OR aluminum OR zinc OR nickel OR lead OR tin OR iron ore OR steel OR base metal) (site:miningweekly.com OR site:mining-technology.com OR site:metalsplace.com OR site:argusmedia.com OR site:woodmac.com OR site:cochilco.cl OR site:spglobal.com) when:3d'),
+
+    # --- Extra energy publications ---
+    "Energy News":
+        gnews('(crude OR oil OR brent OR WTI OR OPEC OR natural gas OR LNG OR diesel OR gasoline OR refinery) (site:eia.gov OR site:iea.org OR site:oilprice.com OR site:platts.com OR site:rigzone.com OR site:energyintel.com OR site:naturalgasintel.com) when:3d'),
+    "Energy News B":
+        gnews('(crude OR oil OR brent OR WTI OR OPEC OR natural gas OR LNG OR diesel OR gasoline OR refinery) (site:offshore-technology.com OR site:energyvoice.com OR site:hydrocarbon-engineering.com OR site:worldoil.com) when:5d'),
 }
 
 
