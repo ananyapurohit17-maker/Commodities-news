@@ -451,9 +451,8 @@ IMAGE_RE = [
 def fetch_article_info(gurl):
     """
     Decode a Google News URL, then extract publisher summary/date/image.
-    Google News stories are only displayed when a real publisher date is found.
     """
-    info = {"url": "", "summary": "", "pub": "", "image": ""}
+    info = {"url": "", "summary": "", "pub": "", "image": "", "fail": ""}
 
     try:
         from googlenewsdecoder import gnewsdecoder
@@ -462,6 +461,7 @@ def fetch_article_info(gurl):
         real = res.get("decoded_url") if res.get("status") else ""
 
         if not real:
+            info["fail"] = f"decode: {res.get('message', 'no message')}"
             return info
 
         info["url"] = real
@@ -508,8 +508,11 @@ def fetch_article_info(gurl):
                 d = datetime(y, mo, dd, tzinfo=IST).astimezone(timezone.utc)
                 info["pub"] = d.isoformat()
 
-    except Exception:
-        pass
+        if not info["pub"]:
+            info["fail"] = "no date found on article page"
+
+    except Exception as exc:
+        info["fail"] = f"{type(exc).__name__}: {exc}"
 
     return info
 
@@ -519,7 +522,7 @@ def timed(fn, arg, seconds):
     t = threading.Thread(target=lambda: box.update(v=fn(arg)), daemon=True)
     t.start()
     t.join(seconds)
-    return box.get("v") or {"url": "", "summary": "", "pub": "", "image": ""}
+    return box.get("v") or {"url": "", "summary": "", "pub": "", "image": "", "fail": "timed out"}
 
 
 def load_cache():
@@ -682,6 +685,8 @@ def fetch_all():
             if pub:
                 item["dt"] = pub
                 item["verified"] = True
+            elif info.get("fail") and fetched <= 12:
+                print(f"[verify-fail] {item['source']} | {item['title'][:40]} | {info['fail']}")
 
     # Save only current Google items.
     try:
@@ -700,29 +705,29 @@ def fetch_all():
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
 
-    # Critical freshness rule:
-    # Direct publisher RSS is trusted.
-    # Google News-discovered articles are kept ONLY if publisher date was verified.
-    out = [
-        i
-        for i in out
-        if i["dt"] is not None
-        and i["dt"] >= cutoff
-        and (not i["google"] or i["verified"])
-    ]
-
+    # Direct publisher RSS is trusted outright.
+    # Google News stories need SOME date (verified, or Google's own feed date)
+    # to be kept — but an unverified one is still shown, flagged with "~",
+    # rather than silently dropped. This matters because publisher-date
+    # verification routinely fails from shared/cloud IPs like GitHub's.
+    out = [i for i in out if i["dt"] is not None and i["dt"] >= cutoff]
     out = sorted(out, key=lambda x: x["dt"], reverse=True)[:MAX_STORIES]
 
     for item in out:
         item["ago"] = time_ago(item["dt"])
-        item["published"] = item["dt"].astimezone(IST).strftime(
+        prefix = "" if item["verified"] else "~"
+        item["ago"] = prefix + item["ago"]
+        item["published"] = prefix + item["dt"].astimezone(IST).strftime(
             "%d %b %Y, %I:%M %p IST"
         )
         item["domain"] = source_domain(item["link"])
 
+    g = [i for i in out if i["google"]]
     print(
-        f"Kept {len(out)} stories; "
-        f"verified Google stories: {sum(1 for i in out if i['google'])}"
+        f"Kept {len(out)} stories "
+        f"({len(out) - len(g)} direct-feed, {len(g)} Google News — "
+        f"{sum(i['verified'] for i in g)} with a verified publisher date, "
+        f"{len(g) - sum(i['verified'] for i in g)} marked ~approximate)"
     )
 
     # Helpful GitHub Actions diagnostics: show exactly which publishers made it.
